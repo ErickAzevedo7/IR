@@ -1,19 +1,31 @@
-import nltk
 import whoosh
 import xml.etree.ElementTree as ET
 from whoosh.analysis import StandardAnalyzer
-from whoosh.fields import Schema, STORED, TEXT, ID
+import whoosh.analysis
+import whoosh.analysis.filters
+from whoosh.fields import Schema, STORED, TEXT, ID, NGRAMWORDS, KEYWORD
+from whoosh import scoring
 import whoosh.fields
 import whoosh.index as index
 import os, glob
-
+import time
+import whoosh.qparser
+import whoosh.query
 import whoosh.reading
+import whoosh.searching
 from utils import *
 from nltk.probability import FreqDist
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
+from nltk.util import ngrams
+from nltk.stem.porter import PorterStemmer
 import string
 import matplotlib.pyplot as plt
+
+def find(name, path):
+    for root, dirs, files in os.walk(path):
+        if name in files:
+            return os.path.join(root, name)
 
 def folderReader(path):
     files = []
@@ -23,7 +35,6 @@ def folderReader(path):
         document = [file, xmlfile]
 
         files.append(document)
-        break
     return files
 
 def fileReader(file, encoding='utf-8'):
@@ -54,10 +65,26 @@ def zipfGrapgh(path, encoding='utf-8'):
 
 def preProcess(text):
     stop_en = stopwords.words('english')
-    analyzer = StandardAnalyzer(stoplist=stop_en)
+    analyzer = StandardAnalyzer(stoplist=stop_en) 
     tokenVector = [token.text for token in analyzer(text)]
+    stemmer = PorterStemmer()
+    processedVector = [stemmer.stem(token) for token in tokenVector]
+
+    return processedVector
+
+def extractSubQueries(tokenVector ,NGRAM=1):
+    if(NGRAM > 1):
+        queryVector = []
+        tokenVector = [ list(tulp) for tulp in ngrams(tokenVector, NGRAM)]
+        for token in tokenVector:
+            query = whoosh.query.Phrase("content", token)
+            queryVector.append(query)
+        return queryVector
 
     return tokenVector
+
+def expandQuery(queries):
+    pass
 
 
 def indexDoc(files):
@@ -70,9 +97,14 @@ def indexDoc(files):
 
     writer = ix.writer()
 
+    index_process_time = []
+    index_time = []
     for file in files:
         rawText = fileReader(file[0])
+
+        start = time.time()
         text = preProcess(rawText)
+        index_process_time.append(time.time() - start)
 
         tree = ET.parse(file[1]).getroot()
         
@@ -81,5 +113,42 @@ def indexDoc(files):
         title = tree.find('feature').get('title')
         
         writer.add_document(title=title, reference=reference, content=text)
+        index_time.append(time.time() - start)
 
     writer.commit()
+
+    # print([term for term in ix.reader().all_terms()])
+    return (index_process_time, index_time)
+
+
+def searchDoc(query):
+    ix = index.open_dir("index")
+
+    with ix.searcher(weighting=scoring.BM25F()) as searcher:
+        # Search
+        results = searcher.search(query, scored=True, limit=10)
+
+        print([(item.fields()['reference'], item.score) for item in results])
+
+        # new_terms = results.key_terms("content", numterms=10, docs=5)
+        # print("terms")
+
+        # expanded_query = whoosh.query.Or([whoosh.query.Term("content", word, boost=weight) for word, weight in new_terms])
+        # print("expanded_query")
+
+        # expanded_results =  searcher.search(expanded_query, scored=True, limit=10)
+        # print("expanded_results")
+
+        # print(expanded_results)
+
+        # print([(item.fields()['reference'], item.score) for item in expanded_results])
+        # print("\n")
+
+        # results.upgrade_and_extend(expanded_results)
+
+        processed_result = [(result.fields(), result.score) for result in results]
+
+        # processed_result.sort(key=lambda result: result[1], reverse=True)
+    
+
+        return processed_result
