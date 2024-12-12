@@ -9,6 +9,7 @@ import whoosh.fields
 import whoosh.index as index
 import os, glob
 import time
+import re
 import whoosh.qparser
 import whoosh.query
 import whoosh.reading
@@ -21,6 +22,12 @@ from nltk.util import ngrams
 from nltk.stem.porter import PorterStemmer
 import string
 import matplotlib.pyplot as plt
+from elasticsearch import Elasticsearch
+from dotenv import load_dotenv
+
+load_dotenv()
+
+client = Elasticsearch(os.getenv('ES_LOCAL_URL'), api_key=(os.getenv('ES_LOCAL_API_KEY')), timeout=400)
 
 def find(name, path):
     for root, dirs, files in os.walk(path):
@@ -64,9 +71,10 @@ def zipfGrapgh(path, encoding='utf-8'):
 
 
 def preProcess(text):
+    text_nonum = re.sub(r'\d+', '', text)
     stop_en = stopwords.words('english')
     analyzer = StandardAnalyzer(stoplist=stop_en) 
-    tokenVector = [token.text for token in analyzer(text)]
+    tokenVector = [token.text for token in analyzer(text_nonum)]
     stemmer = PorterStemmer()
     processedVector = [stemmer.stem(token) for token in tokenVector]
 
@@ -75,17 +83,100 @@ def preProcess(text):
 def extractSubQueries(tokenVector ,NGRAM=1):
     if(NGRAM > 1):
         queryVector = []
-        tokenVector = [ list(tulp) for tulp in ngrams(tokenVector, NGRAM)]
+        tokenVector = [list(tulp) for tulp in ngrams(tokenVector, NGRAM)]
         for token in tokenVector:
             query = whoosh.query.Phrase("content", token)
             queryVector.append(query)
         return queryVector
+    else:
+        queryVector = []
+        for token in tokenVector:
+            query = whoosh.query.Term("content", token)
+            queryVector.append(query)
 
-    return tokenVector
+    return queryVector
+
+def extractSubQueriesElastic(tokenVector, NGRAM=1):
+ 
+    queryVector = []
+    tokenVector = [list(tulp) for tulp in ngrams(tokenVector, NGRAM)]
+    for token in tokenVector:
+        query = {
+            "match_phrase": {
+                "content": " ".join(token)
+            }
+        }
+        queryVector.append(query)
+
+    return queryVector
 
 def expandQuery(queries):
     pass
 
+def indexDocElastic(files):
+    stop_en = stopwords.words('english')
+    if client.indices.exists(index="elastic_index"):
+        client.indices.delete(index="elastic_index")
+
+    resp = client.indices.create(
+        index="elastic_index",
+        settings={
+            "analysis": {
+                "analyzer": {
+                    "default": {
+                        "type": "custom",
+                        "tokenizer": "standard",
+                        "filter": [
+                            "my_stop_words",
+                            "lowercase",
+                            "porter_stem"
+                            ]
+                    }
+                },
+                "filter": {
+                    "my_stop_words": {
+                        "type": "stop",
+                        "stopwords": stop_en
+                    }
+                }
+            }
+        },
+        mappings={
+            "properties": {
+                "reference": {
+                    "type": "keyword",
+                },
+                "title": {
+                    "type": "text",
+                },
+                "content": {
+                    "type": "text",
+                    "analyzer": "default",
+                }
+            }
+        },
+    )
+
+    index_process_time = []
+    index_time = []
+    count = 0
+    for file in files:
+        rawText = fileReader(file[0])
+
+        start = time.time()
+        tree = ET.parse(file[1]).getroot()
+        
+        reference = tree.get('reference')
+
+        title = tree.find('feature').get('title')
+        
+        client.index(index="elastic_index", document={"title": title, "reference": reference, "content": rawText})
+        index_time.append(time.time() - start)
+
+        client.indices.refresh(index="elastic_index")
+
+
+    return (index_process_time, index_time)
 
 def indexDoc(files):
     schema = Schema(title=STORED, reference=ID(stored=True), content=TEXT(vector=True))
@@ -117,38 +208,41 @@ def indexDoc(files):
 
     writer.commit()
 
-    # print([term for term in ix.reader().all_terms()])
     return (index_process_time, index_time)
 
+def searchDocElastic(queries):
+    result = client.search(
+        index="elastic_index",
+        query={
+            "dis_max": {
+                "queries": queries
+            },
+        }
+    )
+
+    return result.body['hits']['hits']
+
+    
 
 def searchDoc(query):
     ix = index.open_dir("index")
 
     with ix.searcher(weighting=scoring.BM25F()) as searcher:
-        # Search
+        query.normalize()
+
         results = searcher.search(query, scored=True, limit=10)
 
-        print([(item.fields()['reference'], item.score) for item in results])
+        new_terms = results.key_terms("content", numterms=10, docs=5)
 
-        # new_terms = results.key_terms("content", numterms=10, docs=5)
-        # print("terms")
+        expanded_query = whoosh.query.Or([whoosh.query.Term("content", word, boost=weight) for word, weight in new_terms])
 
-        # expanded_query = whoosh.query.Or([whoosh.query.Term("content", word, boost=weight) for word, weight in new_terms])
-        # print("expanded_query")
+        expanded_results =  searcher.search(expanded_query, scored=True, limit=10)
 
-        # expanded_results =  searcher.search(expanded_query, scored=True, limit=10)
-        # print("expanded_results")
-
-        # print(expanded_results)
-
-        # print([(item.fields()['reference'], item.score) for item in expanded_results])
-        # print("\n")
-
-        # results.upgrade_and_extend(expanded_results)
+        results.upgrade_and_extend(expanded_results)
 
         processed_result = [(result.fields(), result.score) for result in results]
 
-        # processed_result.sort(key=lambda result: result[1], reverse=True)
+        processed_result.sort(key=lambda result: result[1], reverse=True)
     
 
         return processed_result
